@@ -6,14 +6,39 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Http;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Microsoft.Mcp.Core.Areas.Server;
+using Microsoft.Mcp.Core.Commands;
 using Microsoft.Mcp.Core.Helpers;
+using Microsoft.Security.AntiSSRF;
 
 namespace Microsoft.Mcp.Core.Services.Http;
 
 public static class HttpClientFactoryConfigurator
 {
+    /// <summary>
+    /// The <see cref="IHttpClientFactory"/> client name reserved for shared ARM SDK transports.
+    /// </summary>
+    /// <remarks>
+    /// Separates ARM transport settings from generic and data-plane HTTP clients. Server
+    /// registration applies <see cref="ConfigureArmHttpClient"/> to this name; without that
+    /// registration, clients with this name retain the factory's ordinary defaults.
+    /// </remarks>
+    public const string ArmClientName = "AzureMcpArm";
+
+    /// <summary>
+    /// The factory client name reserved for trusted requests that must not use AntiSSRF.
+    /// </summary>
+    /// <remarks>
+    /// Retains proxy, recording, timeout, and user-agent defaults but has no DNS/IP enforcement.
+    /// Do not choose this name from untrusted tool input. Namespace overrides are applied at
+    /// send time on ordinary clients, not by caching a client with this name.
+    /// This name does not disable explicit EndpointValidator checks in calling code.
+    /// </remarks>
+    public const string NoSsrfClientName = "AzureMcpNoSsrf";
+
     private static readonly string s_version;
     private static readonly string s_framework;
     private static readonly string s_platform;
@@ -28,14 +53,132 @@ public static class HttpClientFactoryConfigurator
         s_platform = RuntimeInformation.OSDescription;
     }
 
+    /// <summary>
+    /// Applies shared HTTP defaults and external-only AntiSSRF protection to factory clients.
+    /// </summary>
+    /// <param name="services">The host's service registrations.</param>
+    /// <param name="recordingProxyResolver">An optional debug-only test-proxy resolver.</param>
+    /// <returns>The service collection for chaining.</returns>
+    /// <remarks>
+    /// Protection uses ExternalOnlyLatest and evaluates namespace overrides on every send.
+    /// The explicit NoSsrfClientName and configured HTTP or recording proxies omit AntiSSRF.
+    /// Proxy routing takes precedence even for destinations excluded by NO_PROXY; callers'
+    /// explicit domain checks remain independent of this transport exception.
+    /// </remarks>
+    /// <exception cref="ArgumentNullException">The service collection is null.</exception>
     public static IServiceCollection ConfigureDefaultHttpClient(
         this IServiceCollection services,
         Func<Uri?>? recordingProxyResolver = null)
     {
         ArgumentNullException.ThrowIfNull(services);
 
+        services.AddCommandContextAccessor();
+        services.AddHttpClient(NoSsrfClientName);
+        services.AddSingleton(new HttpClientFactoryConfiguration(recordingProxyResolver));
         services.ConfigureHttpClientDefaults(builder => ConfigureHttpClientBuilder(builder, recordingProxyResolver));
 
+        return services;
+    }
+
+    /// <summary>
+    /// Reports the configured shared transport posture without creating handlers or sending requests.
+    /// </summary>
+    /// <param name="serviceProvider">The host whose effective options and defaults registration are reported.</param>
+    /// <returns>
+    /// A bounded telemetry value: external_only_latest, http_proxy_override,
+    /// recording_proxy_override, deferred, not_configured when shared defaults were not registered,
+    /// or invalid_configuration when an explicit HTTP proxy cannot be constructed.
+    /// </returns>
+    /// <remarks>
+    /// Reports configuration, not per-request enforcement. Does not capture namespace overrides,
+    /// infer use of NoSsrfClientName, or report custom named transports. In debug builds a custom
+    /// recording resolver makes the decision deferred; the callback is never invoked here.
+    /// Proxy addresses, credentials, and exclusions are never returned.
+    /// An invalid HTTP proxy is reported rather than thrown so enabling telemetry does not
+    /// change startup behavior. Actual handler creation still rejects invalid proxy settings.
+    /// </remarks>
+    /// <exception cref="ArgumentNullException">The service provider is null.</exception>
+    internal static string GetConfiguredSsrfTransportMode(IServiceProvider serviceProvider)
+    {
+        ArgumentNullException.ThrowIfNull(serviceProvider);
+        HttpClientFactoryConfiguration? configuration = serviceProvider.GetService<HttpClientFactoryConfiguration>();
+        if (configuration is null)
+        {
+            return "not_configured";
+        }
+
+        HttpClientOptions options = serviceProvider.GetRequiredService<IOptions<HttpClientOptions>>().Value;
+        (WebProxy? Proxy, Uri? RecordingProxy, bool Deferred) decision;
+        try
+        {
+            decision = ResolveProxyConfiguration(options, configuration.RecordingProxyResolver, evaluateRecordingResolver: false);
+        }
+        catch (ArgumentException)
+        {
+            // Report the failure explicitly without changing the handler's existing validation
+            // or making host startup depend on whether a telemetry listener is enabled.
+            return "invalid_configuration";
+        }
+        return decision.Deferred ? "deferred"
+            : decision.RecordingProxy is not null ? "recording_proxy_override"
+            : decision.Proxy is not null ? "http_proxy_override"
+            : "external_only_latest";
+    }
+
+    /// <summary>
+    /// Disables automatic redirects for the shared server-mode ARM transport, preserving HTTP defaults.
+    /// </summary>
+    /// <param name="services">The server host's service collection.</param>
+    /// <returns>The same service collection, for chaining registrations.</returns>
+    /// <remarks>
+    /// Register during server startup, together with the ordinary HTTP client defaults.
+    /// Only clients named <see cref="ArmClientName"/> are affected; direct CLI registration
+    /// does not invoke this method, and generic clients retain their redirect behavior.
+    /// <para>
+    /// Modifies both namespace-aware transport pools, or the existing terminal handler,
+    /// without replacing the proxy or recording handler chain.
+    /// Factory handler creation throws <see cref="InvalidOperationException"/> if the chain
+    /// has no terminal handler or uses an unsupported terminal handler.
+    /// </para>
+    /// <para>
+    /// This method does not validate endpoints or follow redirects manually. It prevents
+    /// the network handler from following a redirect outside the ARM SDK validation policy.
+    /// </para>
+    /// </remarks>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="services"/> is <see langword="null"/>.
+    /// </exception>
+    public static IServiceCollection ConfigureArmHttpClient(this IServiceCollection services)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        services.AddHttpClient(ArmClientName)
+            .ConfigurePrimaryHttpMessageHandler((handler, _) =>
+            {
+                // Preserve the configured proxy/recording chain, including fixture-provided proxy resolvers.
+                while (handler is DelegatingHandler delegatingHandler)
+                {
+                    handler = delegatingHandler.InnerHandler
+                        ?? throw new InvalidOperationException("The ARM HTTP handler chain has no terminal handler.");
+                }
+
+                switch (handler)
+                {
+                    case HttpClientHandler httpClientHandler:
+                        httpClientHandler.AllowAutoRedirect = false;
+                        break;
+                    case SocketsHttpHandler socketsHttpHandler:
+                        socketsHttpHandler.AllowAutoRedirect = false;
+                        break;
+                    case NamespaceAwareHttpHandler namespaceHandler:
+                        namespaceHandler.DisableAutomaticRedirects();
+                        break;
+                    case AntiSSRFHandler antiSsrfHandler:
+                        antiSsrfHandler.AllowAutoRedirect = false;
+                        break;
+                    default:
+                        throw new InvalidOperationException("The ARM HTTP transport must support disabling automatic redirects.");
+                }
+            });
         return services;
     }
 
@@ -56,15 +199,24 @@ public static class HttpClientFactoryConfigurator
             client.DefaultRequestHeaders.UserAgent.ParseAdd(BuildUserAgent(transport));
         });
 
-        builder.ConfigurePrimaryHttpMessageHandler(serviceProvider => CreateHttpMessageHandler(serviceProvider, recordingProxyResolver));
+        // The defaults builder has no client name. Use the actual handler builder's name
+        // so the explicit unprotected client is not accidentally given the default policy.
+        builder.Services.ConfigureAll<HttpClientFactoryOptions>(options =>
+            options.HttpMessageHandlerBuilderActions.Add(handlerBuilder =>
+                handlerBuilder.PrimaryHandler = CreateHttpMessageHandler(
+                    handlerBuilder.Services, recordingProxyResolver, handlerBuilder.Name)));
     }
 
-    private static HttpMessageHandler CreateHttpMessageHandler(IServiceProvider serviceProvider, Func<Uri?>? recordingProxyResolver)
+    private static HttpMessageHandler CreateHttpMessageHandler(
+        IServiceProvider serviceProvider,
+        Func<Uri?>? recordingProxyResolver,
+        string? clientName)
     {
-        var options = serviceProvider.GetRequiredService<IOptions<HttpClientOptions>>().Value;
-        var handler = new HttpClientHandler();
+        HttpClientOptions options = serviceProvider.GetRequiredService<IOptions<HttpClientOptions>>().Value;
+        var handler = new SocketsHttpHandler();
 
-        var proxy = CreateProxy(options);
+        (WebProxy? proxy, Uri? recordingProxy, _) =
+            ResolveProxyConfiguration(options, recordingProxyResolver, evaluateRecordingResolver: true);
         if (proxy != null)
         {
             handler.Proxy = proxy;
@@ -72,17 +224,66 @@ public static class HttpClientFactoryConfigurator
         }
 
 #if DEBUG
-        var proxyUri = ResolveRecordingProxy(recordingProxyResolver);
-        if (proxyUri != null)
+        if (recordingProxy != null)
         {
-            return new RecordingRedirectHandler(proxyUri)
+            LogProxyProtectionWarning(serviceProvider, clientName);
+            return new RecordingRedirectHandler(recordingProxy)
             {
                 InnerHandler = handler
             };
         }
 #endif
 
-        return handler;
+        if (proxy != null)
+        {
+            LogProxyProtectionWarning(serviceProvider, clientName);
+            return handler;
+        }
+
+        if (clientName == NoSsrfClientName)
+        {
+            return handler;
+        }
+
+        // Keep independent pools: a private connection opened under an override must never
+        // be reused by a later protected request on the same cached SDK client.
+        var policy = new AntiSSRFPolicy(PolicyConfigOptions.ExternalOnlyLatest);
+        return new NamespaceAwareHttpHandler(
+            policy.GetHandler(), handler, serviceProvider.GetRequiredService<ICommandContextAccessor>());
+    }
+
+    private static void LogProxyProtectionWarning(IServiceProvider serviceProvider, string? clientName)
+        => serviceProvider.GetRequiredService<ILoggerFactory>()
+            .CreateLogger(typeof(HttpClientFactoryConfigurator).FullName!)
+            .LogWarning("Proxy configuration takes precedence for HTTP client {ClientName} and disables transport-level AntiSSRF protections. Endpoint domain validation remains enabled unless separately bypassed.", clientName);
+
+    /// <summary>
+    /// Applies the proxy precedence shared by startup reporting and actual handler creation.
+    /// </summary>
+    /// <param name="options">The effective factory HTTP settings.</param>
+    /// <param name="recordingProxyResolver">The optional debug recording callback.</param>
+    /// <param name="evaluateRecordingResolver">Whether a custom callback may be invoked for handler creation.</param>
+    /// <returns>The explicit proxy, recording route, and whether the recording decision is deferred.</returns>
+    /// <exception cref="ArgumentException">The HTTP proxy address is not an absolute URI.</exception>
+    /// <exception cref="InvalidOperationException">An evaluated recording callback returns a relative URI.</exception>
+    private static (WebProxy? Proxy, Uri? RecordingProxy, bool Deferred) ResolveProxyConfiguration(
+        HttpClientOptions options,
+        Func<Uri?>? recordingProxyResolver,
+        bool evaluateRecordingResolver)
+    {
+        WebProxy? proxy = CreateProxy(options);
+#if DEBUG
+        // A custom resolver takes priority over environment settings and explicit HTTP proxies.
+        // Do not guess its outcome or trigger fixture initialization merely to emit startup telemetry.
+        if (recordingProxyResolver is not null && !evaluateRecordingResolver)
+        {
+            return (proxy, null, true);
+        }
+
+        return (proxy, ResolveRecordingProxy(recordingProxyResolver), false);
+#else
+        return (proxy, null, false);
+#endif
     }
 
 #if DEBUG
@@ -133,7 +334,7 @@ public static class HttpClientFactoryConfigurator
 
         if (!Uri.TryCreate(proxyAddress, UriKind.Absolute, out var proxyUri))
         {
-            return null;
+            throw new ArgumentException("The configured HTTP proxy must be an absolute URI.", nameof(options));
         }
 
         var proxy = new WebProxy(proxyUri);

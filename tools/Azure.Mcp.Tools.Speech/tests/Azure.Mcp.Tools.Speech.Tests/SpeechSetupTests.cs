@@ -87,7 +87,7 @@ public class SpeechSetupTests
         Assert.NotNull(sttGroup);
 
         Assert.True(sttGroup.Commands.ContainsKey("recognize"));
-        var recognizeCommand = sttGroup.Commands["recognize"];
+        var recognizeCommand = sttGroup.Commands["recognize"].Command;
         Assert.NotNull(recognizeCommand);
         Assert.NotNull(recognizeCommand.Description);
         Assert.NotEmpty(recognizeCommand.Description);

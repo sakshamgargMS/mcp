@@ -28,6 +28,7 @@ using Microsoft.Mcp.Core.Models;
 using Microsoft.Mcp.Core.Models.Command;
 using Microsoft.Mcp.Core.Services.Azure.Authentication;
 using Microsoft.Mcp.Core.Services.Caching;
+using Microsoft.Mcp.Core.Services.Http;
 using Microsoft.Mcp.Core.Services.Telemetry;
 using ModelContextProtocol.Protocol;
 using OpenTelemetry;
@@ -152,7 +153,7 @@ public sealed class ServerStartCommand : BaseCommand<ServerStartOptions, string>
             await host.StartAsync(cancellationToken);
 
             var telemetryService = host.Services.GetRequiredService<ITelemetryService>();
-            LogStartTelemetry(telemetryService, options);
+            LogStartTelemetry(telemetryService, options, host.Services);
 
             await host.WaitForShutdownAsync(cancellationToken);
 
@@ -165,8 +166,27 @@ public sealed class ServerStartCommand : BaseCommand<ServerStartOptions, string>
         }
     }
 
-    internal static void LogStartTelemetry(ITelemetryService telemetryService, ServerStartOptions options)
+    /// <summary>
+    /// Emits successful-start configuration, including privacy-safe SSRF posture, through the usage activity.
+    /// </summary>
+    /// <param name="telemetryService">The initialized telemetry service that honors the host's telemetry opt-outs.</param>
+    /// <param name="options">The startup options used to configure the namespace overrides.</param>
+    /// <param name="serviceProvider">The started host whose effective shared transport settings are reported.</param>
+    /// <remarks>
+    /// Reports startup configuration, not enforcement on every request. Transport proxy exceptions and
+    /// namespace overrides are independent dimensions. Only bounded categories and an entry count are
+    /// added for SSRF: no proxy addresses, credentials, exclusions, or raw override namespaces.
+    /// Does not create HTTP handlers or invoke custom recording resolvers.
+    /// </remarks>
+    /// <exception cref="ArgumentNullException">A required argument is null.</exception>
+    internal static void LogStartTelemetry(
+        ITelemetryService telemetryService,
+        ServerStartOptions options,
+        IServiceProvider serviceProvider)
     {
+        ArgumentNullException.ThrowIfNull(telemetryService);
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(serviceProvider);
         using var activity = telemetryService.StartActivity(ActivityName.ServerStarted);
 
         if (activity != null)
@@ -177,6 +197,19 @@ public sealed class ServerStartCommand : BaseCommand<ServerStartOptions, string>
             activity.SetTag(TagName.DangerouslyDisableElicitation, options.DangerouslyDisableElicitation);
             activity.SetTag(TagName.DangerouslyDisableHttpIncomingAuth, options.DangerouslyDisableHttpIncomingAuth);
             activity.SetTag(TagName.IsDebug, options.Debug);
+            activity.SetTag(TagName.SsrfTransportMode, HttpClientFactoryConfigurator.GetConfiguredSsrfTransportMode(serviceProvider));
+
+            // Preserve the validator's matching semantics: ignore blank entries and casing,
+            // but do not trim a non-blank entry into an ALL override the validator would not recognize.
+            string[] overrides = (options.DangerouslyDisableSsrfProtectionsByNamespace ?? [])
+                .Where(value => !string.IsNullOrWhiteSpace(value))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            string overrideScope = overrides.Length == 0 ? "none"
+                : overrides.Contains(EndpointValidator.AllNamespaces, StringComparer.OrdinalIgnoreCase) ? "all"
+                : "selected";
+            activity.SetTag(TagName.SsrfNamespaceOverrideScope, overrideScope);
+            activity.SetTag(TagName.SsrfNamespaceOverrideCount, overrides.Length);
 
             if (options.Namespace != null && options.Namespace.Length > 0)
             {

@@ -6,6 +6,7 @@ using System.Net.Sockets;
 using System.Security;
 using Azure.ResourceManager;
 using Microsoft.Extensions.Logging;
+using Microsoft.Mcp.Core.Commands;
 using Microsoft.Security.AntiSSRF;
 
 namespace Microsoft.Mcp.Core.Helpers;
@@ -74,7 +75,21 @@ public static partial class EndpointValidator
         }
     }
 
-    private static bool AreSsrfProtectionsDangerouslyDisabled(string? executingToolNamespaceName)
+    /// <summary>
+    /// Checks the startup-configured emergency override for an executing tool namespace.
+    /// </summary>
+    /// <param name="executingToolNamespaceName">
+    /// The original registered namespace of the currently running tool (aka area setup name of the running <see cref="IBaseCommand"/>),
+    /// not an endpoint service key or caller-supplied routing name. Null, empty, and whitespace values for this parameter
+    /// always default to enabling protections, even if <see cref="AllNamespaces"/> was used for disabling protections.
+    /// </param>
+    /// <returns>Whether SSRF protections are explicitly disabled for this namespace.</returns>
+    /// <remarks>
+    /// Shared endpoint validators and HTTP transports use this same write-once configuration.
+    /// Query for each request rather than caching the result in a service or reusable SDK client.
+    /// This method does not change configuration or account for transport-specific proxy exceptions.
+    /// </remarks>
+    public static bool AreSsrfProtectionsDangerouslyDisabled(string? executingToolNamespaceName)
         => AreSsrfProtectionsDangerouslyDisabled(
             DangerouslyDisabledSsrfProtectionNamespaces,
             executingToolNamespaceName);

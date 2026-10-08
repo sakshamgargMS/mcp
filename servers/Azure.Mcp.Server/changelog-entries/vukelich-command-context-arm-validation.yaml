@@ -1,0 +1,7 @@
+changes:
+  - section: "Bugs Fixed"
+    description: "Preserve original tool namespaces in command registrations, expose a single active command context per asynchronous flow, validate every shared ARM SDK request, including retries, paging, and sends without a command context, and disable automatic redirects for the server ARM transport."
+  - section: "Bugs Fixed"
+    description: "Apply external-only AntiSSRF protection to shared HTTP factory transports with request-time namespace overrides and isolated connection pools. Use SocketsHttpHandler for ordinary transports, preserving explicit unprotected clients and proxy routing with warnings that proxy configurations disable transport-level protections."
+  - section: "Bugs Fixed"
+    description: "Report configured SSRF transport mode and namespace override scope/count in startup usage telemetry without exporting proxy addresses, credentials, exclusions, or raw override namespaces."

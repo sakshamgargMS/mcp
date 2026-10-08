@@ -4,6 +4,7 @@
 using System.Net;
 using System.Text;
 using Azure.Core;
+using Azure.Core.Pipeline;
 using Azure.Mcp.Core.Services.Azure;
 using Azure.Mcp.Tools.Quota.Services;
 using Azure.Mcp.Tools.Quota.Services.Util;
@@ -132,6 +133,13 @@ public sealed class AzureUsageCheckerEndpointValidationTests
             .Returns(Task.FromResult(credential));
         azureService.GetClient(Arg.Any<string?>())
             .Returns(_ => new HttpClient(handler, disposeHandler: false));
+        azureService.When(service => service.ConfigureArmClientOptions(Arg.Any<ArmClientOptions>()))
+            .Do(call =>
+            {
+                ArmClientOptions options = call.Arg<ArmClientOptions>();
+                options.Transport = new HttpClientTransport(azureService.GetClient());
+                options.Environment = armEnvironment;
+            });
 
         return new QuotaService(azureService, NullLoggerFactory.Instance);
     }

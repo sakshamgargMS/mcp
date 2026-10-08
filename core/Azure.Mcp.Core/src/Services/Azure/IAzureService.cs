@@ -2,6 +2,8 @@
 // Licensed under the MIT License.
 
 using Azure.Core;
+using Azure.Core.Pipeline;
+using Azure.ResourceManager;
 using Azure.ResourceManager.Resources;
 using Microsoft.Mcp.Core.Models.Resource;
 using Microsoft.Mcp.Core.Models.ResourceGroup;
@@ -22,6 +24,36 @@ public interface IAzureService
     IAzureCloudConfiguration CloudConfiguration { get; }
 
     /// <summary>
+    /// Configures shared ARM client options with the cloud, HTTP transport, and command-aware endpoint policy.
+    /// </summary>
+    /// <param name="armClientOptions">
+    /// The mutable options to configure before constructing an <see cref="ArmClient"/>.
+    /// </param>
+    /// <remarks>
+    /// Called by <see cref="Helpers.AzureHelper.CreateArmClientAsync"/> during shared ARM client creation.
+    /// Replaces the transport and environment with the configured cloud and a factory-created
+    /// ARM transport, while preserving other caller-supplied options. Configure once per
+    /// options instance before constructing the client, not on each request from a cached client.
+    /// <para>
+    /// Adds endpoint validation at <see cref="HttpPipelinePosition.BeforeTransport"/>.
+    /// The policy reads <see cref="Microsoft.Mcp.Core.Commands.ICommandContextAccessor.CurrentContext"/>
+    /// on every send, including retries, paging, and long-running-operation polling. It does not
+    /// capture the namespace present when the client is created.
+    /// </para>
+    /// <para>
+    /// Every send validates, even without an active command execution scope. A missing context
+    /// or unresolved namespace is passed as null to the validator and cannot enable a namespace
+    /// bypass, including ALL. Server registration disables automatic redirects
+    /// for the dedicated ARM transport. Independently, its HTTP transport applies external-only
+    /// AntiSSRF checks, except for configured proxies or the current namespace's explicit override.
+    /// </para>
+    /// </remarks>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="armClientOptions"/> is <see langword="null"/>.
+    /// </exception>
+    void ConfigureArmClientOptions(ArmClientOptions armClientOptions);
+
+    /// <summary>
     /// Gets a new instance of <see cref="HttpClient"/> configured for use with Azure operations.
     /// </summary>
     /// <remarks>
@@ -31,6 +63,7 @@ public interface IAzureService
     /// <item><description>Record/playback handler</description></item>
     /// <item><description>Timeout configuration</description></item>
     /// <item><description>User-Agent header</description></item>
+    /// <item><description>ExternalOnlyLatest AntiSSRF protection, unless overridden by proxy configuration or the executing namespace.</description></item>
     /// </list>
     /// <para>Do:</para>
     /// <list type="bullet">
@@ -39,8 +72,19 @@ public interface IAzureService
     /// </list>
     /// <para>Don't:</para>
     /// <list type="bullet">
-    /// <item><description>Persist the client beyond the lifetime of the invoking tool.</description></item>
+    /// <item><description>Cache a namespace override decision in a reusable SDK client.</description></item>
     /// </list>
+    /// <para>
+    /// Namespace overrides are evaluated on each send using the original registered command
+    /// namespace, including when SDK clients are reused. Without an active context, or when
+    /// its namespace is unresolved, no namespace override applies.
+    /// The reserved HttpClientFactoryConfigurator.NoSsrfClientName deliberately
+    /// omits AntiSSRF and must be used only for trusted infrastructure, never untrusted tool input.
+    /// </para>
+    /// <para>
+    /// Configured HTTP and debug recording proxies take precedence over transport protection.
+    /// This exception does not disable explicit EndpointValidator domain checks.
+    /// </para>
     /// </remarks>
     /// <param name="name">The logical name of the client to create.</param>
     /// <returns>
